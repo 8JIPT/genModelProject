@@ -143,14 +143,104 @@ torchrun --nnodes=1 --nproc_per_node=N sample_ddp.py ODE --model SiT-XL/2 --like
 
 Notice that only under ODE sampler likelihood can be calculated; see [`sample_ddp.py`](sample_ddp.py) for more details and settings. 
 
+## SiT-S/2 architecture ablations
+
+The `--variant` option selects four architectures without changing the original
+`SiT-S/2` baseline state-dict keys:
+
+| Variant | Attention in blocks 0–7 | Attention in blocks 8–11 | Long skips |
+| --- | --- | --- | --- |
+| `baseline` | Original full attention | Original full attention | None |
+| `linear` | Original full attention | LiT linear attention | None |
+| `uvit` | Original full attention | Original full attention | Output 2 → input 9; output 1 → input 10 |
+| `linear_uvit` | Original full attention | LiT linear attention | Same two skips |
+
+Block numbers are zero based. Each skip concatenates `[current_deep, saved_shallow]`
+and applies its own `Linear(2 * hidden_size, hidden_size)` immediately before the
+target block. Its weight starts as `[I, 0]` with zero bias, so the skip is exactly
+the identity at initialization. The two shallow features are the only saved skip
+activations. The original block residual, MLP, timestep/class conditioning, and
+adaLN are unchanged.
+
+The provided `LiT_linearAttn.LinearAttention` is used directly. It has separate
+`q` and `kv` projections and a depthwise 5×5 convolution over a square token grid.
+SiT-S/2 at 256×256 has a 32×32 VAE latent and a 16×16 token grid (256 tokens,
+384 channels, six 64-channel heads), which satisfies its shape requirements. The
+LiT source had only its unused `einops` import and constructor print removed; a
+square-grid check was added. Its `q`, `kv`, and convolution parameters are newly
+initialized. Original full-attention `qkv` weights are omitted only for replaced
+blocks; all other pretrained weights load unchanged. The loader reports every
+omitted, missing, and unexpected key and rejects any mismatch beyond those new
+modules. Baseline loads strictly. An original SiT-S/2 checkpoint must be supplied
+locally; this repository auto-downloads only SiT-XL/2.
+
+Run from this directory with an image-folder dataset and a local original
+SiT-S/2 checkpoint. The same starting checkpoint, dataset, random seed,
+transport, VAE, effective batch size, and training schedule should be used for
+all four runs. With batch size 1 and accumulation 8, the effective batch is 8.
+`--no-ema` and `--sample-every 0` reduce peak GPU memory; use them consistently
+across runs. Single-GPU training runs directly with `python train.py` on Windows
+or Linux. Multi-GPU training still uses `torchrun`.
+
+For the local Windows conda environment, run these PowerShell commands after
+replacing the two placeholder paths:
+
+```powershell
+$python = 'D:\Users\CLIENTE\anaconda3\envs\SiT\python.exe'
+$common = @('--model', 'SiT-S/2', '--image-size', '256', '--data-path', 'D:\path\to\image-folder', '--pretrained', 'D:\path\to\original-SiT-S-2.pt', '--global-batch-size', '1', '--grad-accum-steps', '8', '--precision', 'fp16', '--gradient-checkpointing', '--no-ema', '--sample-every', '0', '--num-workers', '0', '--global-seed', '0')
+& $python train.py @common --variant baseline
+& $python train.py @common --variant linear
+& $python train.py @common --variant uvit
+& $python train.py @common --variant linear_uvit
+```
+
+The baseline trains all original SiT parameters. By default, each modified
+variant freezes all unchanged SiT parameters (`requires_grad=False`) and trains
+only its four linear-attention modules, its two skip projections, or both,
+respectively. `--no-freeze-backbone` explicitly enables full fine-tuning. This
+default changes the number of trainable parameters between runs; report it with
+results because it affects the interpretation of an architecture ablation.
+Startup logs show total/trainable parameters, attention block indices, and skips.
+The optimizer includes only trainable parameters. Frozen prefixes naturally
+retain no backward graph; after a trainable skip or attention module, autograd
+still tracks the input path through frozen layers so gradients reach the new
+module. `--gradient-checkpointing` uses non-reentrant PyTorch checkpointing;
+PyTorch 2.x is recommended. For 8 GB VRAM, try `--precision fp16` first, or
+`--precision bf16` on supported GPUs. Adjust accumulation without changing the
+effective batch across experiments.
+
+`--pretrained` starts a new run from original model weights. `--ckpt` resumes a
+full training checkpoint, including optimizer and step; it cannot be combined
+with `--pretrained`. For sampling a trained variant:
+
+```bash
+python sample.py ODE --model SiT-S/2 --variant linear_uvit --image-size 256 --ckpt /path/to/trained-checkpoint.pt
+```
+
+For a local smoke test, including exact equality between default and explicit
+baseline initialization, run:
+
+```bash
+python verify_variants.py --device cpu --pretrained /path/to/original-SiT-S-2.pt
+```
+
+Omit `--pretrained` to check construction and forward passes without weights.
+With a checkpoint, the baseline strict load and each variant's expected key
+differences are also checked. Sampling from original weights with a modified
+variant is possible for inspection but its new modules are untrained.
+Add `--check-backward` to verify gradients through the frozen backbone and
+checkpointed blocks using a synthetic nonzero output/gate signal. Add `--amp`
+with `--device cuda` to run those checks under fp16 autocast.
+
 ### Enhancements
+
 Training (and sampling) could likely be speed-up significantly by:
 - [ ] using [Flash Attention](https://github.com/HazyResearch/flash-attention) in the SiT model
 - [ ] using `torch.compile` in PyTorch 2.0
 
 Basic features that would be nice to add:
 - [ ] Monitor FID and other metrics
-- [ ] AMP/bfloat16 support
+- [x] AMP/bfloat16 support in `train.py`
 
 Precision in likelihood calculation could likely be improved by:
 - [ ] Uniform / Gaussian Dequantization

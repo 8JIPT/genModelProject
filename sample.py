@@ -9,7 +9,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
 from diffusers.models import AutoencoderKL
-from download import find_model
+from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
 from models import SiT_models
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from transport import create_transport, Sampler
@@ -29,9 +29,9 @@ def main(mode, args):
         assert args.image_size in [256, 512]
         assert args.num_classes == 1000
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
-        learn_sigma = args.image_size == 256
-    else:
-        learn_sigma = False
+    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
+    state_dict = model_weights(read_checkpoint(ckpt_path), prefer_ema=True)
+    learn_sigma = infer_learn_sigma(state_dict, patch_size=int(args.model.split("/")[-1]))
 
     # Load model:
     latent_size = args.image_size // 8
@@ -39,11 +39,17 @@ def main(mode, args):
         input_size=latent_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
+        variant=args.variant,
     ).to(device)
-    # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
-    model.load_state_dict(state_dict)
+    has_variant_weights = any(key.startswith("skip_projections.") for key in state_dict) or any(
+        key.startswith(f"blocks.{i}.attn.kv.") for i in model.linear_block_indices)
+    if args.variant != "baseline" and not has_variant_weights:
+        load_pretrained(model, state_dict)
+        print("Warning: new variant modules are untrained; sample only after fine-tuning.")
+    else:
+        model.load_state_dict(state_dict, strict=True)
+        print("Checkpoint load: missing keys: []; unexpected keys: []")
+    print(model.architecture_summary())
     model.eval()  # important!
     transport = create_transport(
         args.path_type,
@@ -122,6 +128,7 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)

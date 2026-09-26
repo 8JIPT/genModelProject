@@ -1,3 +1,6 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
@@ -11,8 +14,6 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-from torch.utils.checkpoint import checkpoint
-from LiT_linearAttn import LinearAttention
 
 
 def modulate(x, shift, scale):
@@ -94,18 +95,72 @@ class LabelEmbedder(nn.Module):
 
 
 #################################################################################
-#                                 Core SiT Model                                #
+#                            Linear Self-Attention                              #
 #################################################################################
 
-class SiTBlock(nn.Module):
+class LinearAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., 
+                 kernel_function=nn.ReLU, kernel_size=5):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.dwc = nn.Conv2d(in_channels=head_dim, out_channels=head_dim, kernel_size=kernel_size,
+                             groups=head_dim, padding=kernel_size // 2)
+        self.kernel_function = kernel_function()
+
+    def forward(self, x):
+        B, N, C = x.shape
+        if math.isqrt(N) ** 2 != N:
+            raise ValueError("LiT linear attention requires a square token grid")
+        q = self.q(x)   # (B, N, C) (32, 256, 384)
+
+        kv = self.kv(x).reshape(B, -1, 2, C).permute(2, 0, 1, 3)   # (2, B, N, C) (2, 32, 256, 384)
+        k, v = kv[0], kv[1]   # (B, N, C) (32, 256, 384)
+
+        q = self.kernel_function(q) + 1e-6   # (B, N, C) (32, 256, 384)
+        k = self.kernel_function(k) + 1e-6   # (B, N, C) (32, 256, 384)
+
+        q = q.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)   # (B, H, N, C/H) (32, 6, 256, 64)
+        k = k.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)   # (B, H, N, C/H) (32, 6, 256, 64)
+        v = v.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)   # (B, H, N, C/H) (32, 6, 256, 64)
+
+        z = 1 / (q @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6)   # (B, H, N, 1) (32, 6, 256, 1)
+        kv = (k.transpose(-2, -1) * (N ** -0.5)) @ (v * (N ** -0.5))   # (B, H, C/H, N) @ (B, H, N, C/H) = (B, H, C/H, C/H): (32, 6, 256, 256) 
+        x = q @ kv * z   # (B, H, N, C/H) @ (B, H, C/H, C/H) * (B, H, N, 1) = (B, H, N, C/H): (32, 6, 256, 64) 
+
+        H = W = int(N ** 0.5)
+        x = x.transpose(1, 2).reshape(B, N, C)   # (B, N, C): (32, 256, 384) 
+        v = v.reshape(B * self.num_heads, H, W, -1).permute(0, 3, 1, 2)   # (B*H, C/H, H, W): (32*6, 64, 16, 16) 
+        x = x + self.dwc(v).reshape(B, C, N).permute(0, 2, 1)   # (B, N, C): (32, 256, 384) 
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+#################################################################################
+#                                 Core DiT Model                                #
+#################################################################################
+
+class DiTBlock(nn.Module):
     """
-    A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, linear_attention=False, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        attention_cls = LinearAttention if linear_attention else Attention
-        self.attn = attention_cls(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = LinearAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -124,7 +179,7 @@ class SiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
     """
-    The final layer of SiT.
+    The final layer of DiT.
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -142,7 +197,7 @@ class FinalLayer(nn.Module):
         return x
 
 
-class SiT(nn.Module):
+class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -158,8 +213,6 @@ class SiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        variant="baseline",
-        gradient_checkpointing=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -167,17 +220,6 @@ class SiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
-        if variant not in ("baseline", "linear", "uvit", "linear_uvit"):
-            raise ValueError(f"Unknown SiT variant: {variant}")
-        if depth < 12 and variant in ("uvit", "linear_uvit"):
-            raise ValueError("Long skips require at least 12 blocks")
-        if depth < 4 and variant in ("linear", "linear_uvit"):
-            raise ValueError("Linear attention requires at least four blocks")
-        self.variant = variant
-        self.gradient_checkpointing = gradient_checkpointing
-        self.linear_block_indices = tuple(range(depth - 4, depth)) if "linear" in variant else ()
-        # Source output -> target input. The projection is applied before the target block.
-        self.skip_sources = {depth - 3: 2, depth - 2: 1} if "uvit" in variant else {}
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -187,42 +229,10 @@ class SiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
-                     linear_attention=i in self.linear_block_indices) for i in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.skip_projections = nn.ModuleDict({str(i): nn.Linear(2 * hidden_size, hidden_size)
-                                                for i in self.skip_sources})
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
-        # Concatenation order is [deep, shallow]. At initialization, this is exactly
-        # the identity on the deep path and zero on the new shallow path.
-        for projection in self.skip_projections.values():
-            with torch.no_grad():
-                projection.weight.zero_()
-                projection.weight[:, :hidden_size].copy_(torch.eye(hidden_size))
-                projection.bias.zero_()
-
-    def freeze_backbone(self):
-        """Train only new attention modules and/or long-skip projections."""
-        if self.variant == "baseline":
-            raise ValueError("The baseline has no newly introduced modules to train")
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
-        for index in self.linear_block_indices:
-            for parameter in self.blocks[index].attn.parameters():
-                parameter.requires_grad_(True)
-        for parameter in self.skip_projections.parameters():
-            parameter.requires_grad_(True)
-
-    def architecture_summary(self):
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        full = [i for i in range(len(self.blocks)) if i not in self.linear_block_indices]
-        skips = [(source, target) for target, source in self.skip_sources.items()]
-        return (f"Variant: {self.variant}; parameters: {total:,} total, "
-                f"{trainable:,} trainable ({100 * trainable / total:.2f}%); "
-                f"full attention blocks: {full}; linear attention blocks: "
-                f"{list(self.linear_block_indices)}; skips (source output -> target input): {skips}")
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -249,7 +259,7 @@ class SiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers in SiT blocks:
+        # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
@@ -277,7 +287,7 @@ class SiT(nn.Module):
 
     def forward(self, x, t, y):
         """
-        Forward pass of SiT.
+        Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
@@ -286,26 +296,15 @@ class SiT(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        skips = {}
-        for index, block in enumerate(self.blocks):
-            if index in self.skip_sources:
-                source = self.skip_sources[index]
-                x = self.skip_projections[str(index)](torch.cat([x, skips.pop(source)], dim=-1))
-            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
-                x = checkpoint(block, x, c, use_reentrant=False)
-            else:
-                x = block(x, c)                  # (N, T, D)
-            if index in self.skip_sources.values():
-                skips[index] = x
+        for block in self.blocks:
+            x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
-        if self.learn_sigma:
-            x, _ = x.chunk(2, dim=1)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
-        Forward pass of SiT, but also batches the unconSiTional forward pass for classifier-free guidance.
+        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
@@ -378,49 +377,49 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 #################################################################################
-#                                   SiT Configs                                  #
+#                                   DiT Configs                                  #
 #################################################################################
 
-def SiT_XL_2(**kwargs):
-    return SiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def DiT_XL_2(**kwargs):
+    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=4, **kwargs)
 
-def SiT_XL_4(**kwargs):
-    return SiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def DiT_XL_4(**kwargs):
+    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
-def SiT_XL_8(**kwargs):
-    return SiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+def DiT_XL_8(**kwargs):
+    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
-def SiT_L_2(**kwargs):
-    return SiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def DiT_L_2(**kwargs):
+    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=4, **kwargs)
 
-def SiT_L_4(**kwargs):
-    return SiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+def DiT_L_4(**kwargs):
+    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
-def SiT_L_8(**kwargs):
-    return SiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+def DiT_L_8(**kwargs):
+    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
-def SiT_B_2(**kwargs):
-    return SiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+def DiT_B_2(**kwargs):
+    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=3, **kwargs)
 
-def SiT_B_4(**kwargs):
-    return SiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+def DiT_B_4(**kwargs):
+    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
-def SiT_B_8(**kwargs):
-    return SiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+def DiT_B_8(**kwargs):
+    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
-def SiT_S_2(**kwargs):
-    return SiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+def DiT_S_2(**kwargs):
+    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=2, **kwargs)
 
-def SiT_S_4(**kwargs):
-    return SiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+def DiT_S_4(**kwargs):
+    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
-def SiT_S_8(**kwargs):
-    return SiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+def DiT_S_8(**kwargs):
+    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-SiT_models = {
-    'SiT-XL/2': SiT_XL_2,  'SiT-XL/4': SiT_XL_4,  'SiT-XL/8': SiT_XL_8,
-    'SiT-L/2':  SiT_L_2,   'SiT-L/4':  SiT_L_4,   'SiT-L/8':  SiT_L_8,
-    'SiT-B/2':  SiT_B_2,   'SiT-B/4':  SiT_B_4,   'SiT-B/8':  SiT_B_8,
-    'SiT-S/2':  SiT_S_2,   'SiT-S/4':  SiT_S_4,   'SiT-S/8':  SiT_S_8,
+DiT_models = {
+    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
+    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
+    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
+    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
 }

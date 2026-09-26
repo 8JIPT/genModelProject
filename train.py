@@ -23,9 +23,11 @@ from time import time
 import argparse
 import logging
 import os
+from contextlib import nullcontext
+from functools import partial
 
 from models import SiT_models
-from download import find_model
+from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
 from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
@@ -61,14 +63,15 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if not dist.is_initialized() or dist.get_rank() == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -113,23 +116,29 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    # A single GPU can train directly (including on Windows); torchrun retains DDP.
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if distributed:
+        dist.init_process_group("gloo" if os.name == "nt" else "nccl")
+        rank = dist.get_rank()
+        device = int(os.environ["LOCAL_RANK"])
+    else:
+        rank = 0
+        device = 0
+    assert args.global_batch_size % world_size == 0, "Batch size must be divisible by world size."
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-    local_batch_size = int(args.global_batch_size // dist.get_world_size())
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
+    local_batch_size = int(args.global_batch_size // world_size)
 
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
-        experiment_name = f"{experiment_index:03d}-{model_string_name}-" \
+        experiment_name = f"{experiment_index:03d}-{model_string_name}-{args.variant}-" \
                         f"{args.path_type}-{args.prediction}-{args.loss_weight}"
         experiment_dir = f"{args.results_dir}/{experiment_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
@@ -137,35 +146,63 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-        entity = os.environ["ENTITY"]
-        project = os.environ["PROJECT"]
         if args.wandb:
-            wandb_utils.initialize(args, entity, experiment_name, project)
+            wandb_utils.initialize(args, os.environ["ENTITY"], experiment_name, os.environ["PROJECT"])
     else:
         logger = create_logger(None)
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
+    if args.pretrained and args.ckpt:
+        raise ValueError("Use --pretrained for a new run or --ckpt to resume, not both")
+    if args.variant != "baseline" and not (args.pretrained or args.ckpt):
+        raise ValueError("A variant requires --pretrained original SiT weights or --ckpt to resume")
+    pretrained_weights = model_weights(read_checkpoint(args.pretrained)) if args.pretrained else None
+    resume = read_checkpoint(args.ckpt) if args.ckpt else None
+    source_weights = pretrained_weights if pretrained_weights is not None else (
+        resume["model"] if resume is not None and "model" in resume else None)
+    patch_size = int(args.model.split("/")[-1])
+    checkpoint_learn_sigma = (infer_learn_sigma(source_weights, patch_size=patch_size)
+                              if source_weights is not None else None)
+    if (args.learn_sigma is not None and checkpoint_learn_sigma is not None
+            and args.learn_sigma != checkpoint_learn_sigma):
+        raise ValueError("--learn-sigma setting conflicts with checkpoint final layer shape")
+    learn_sigma = (checkpoint_learn_sigma if checkpoint_learn_sigma is not None else
+                   (args.learn_sigma if args.learn_sigma is not None else True))
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        learn_sigma=learn_sigma,
+        variant=args.variant,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
-    # Note that parameter initialization is done within the SiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    if pretrained_weights is not None:
+        load_pretrained(model, pretrained_weights, logger.info)
+    if resume is not None:
+        if not all(key in resume for key in ("model", "opt", "args")):
+            raise ValueError("--ckpt requires a full training checkpoint; use --pretrained for model weights")
+        previous = resume["args"]
+        if (previous.model, previous.image_size, getattr(previous, "variant", "baseline")) != (
+                args.model, args.image_size, args.variant):
+            raise ValueError("Checkpoint model, image size, or variant does not match this run")
+        model.load_state_dict(resume["model"], strict=True)
+        logger.info("Resumed model: strict load; missing keys: []; unexpected keys: []")
+    freeze_backbone = args.freeze_backbone
+    if freeze_backbone is None:
+        freeze_backbone = args.variant != "baseline"
+    if freeze_backbone:
+        model.freeze_backbone()
+    logger.info(model.architecture_summary())
+    ema = deepcopy(model).to(device) if args.ema else None
+    if ema is not None:
+        requires_grad(ema, False)
 
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
-
-    requires_grad(ema, False)
-    
-    model = DDP(model.to(device), device_ids=[device])
+    model = model.to(device)
+    if distributed:
+        model = DDP(model, device_ids=[device])
+    raw_model = model.module if distributed else model
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -175,14 +212,27 @@ def main(args):
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    vae.requires_grad_(False).eval()
+    # Only parameters with gradients are passed to the optimizer.
+    opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                            lr=args.learning_rate, weight_decay=0)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "fp16")
+    if resume is not None:
+        opt.load_state_dict(resume["opt"])
+        if ema is not None:
+            if "ema" not in resume:
+                raise ValueError("Resume checkpoint has no EMA; use --no-ema")
+            ema.load_state_dict(resume["ema"], strict=True)
+        if args.precision == "fp16" and "scaler" in resume:
+            scaler.load_state_dict(resume["scaler"])
+    # Different variants initialize different numbers of new parameters. Reset
+    # the training RNG so data order, VAE sampling, and transport noise start
+    # from the same seed in each ablation run.
+    torch.manual_seed(seed)
 
     # Setup data:
     transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        transforms.Lambda(partial(center_crop_arr, image_size=args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
@@ -190,7 +240,7 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=dist.get_world_size(),
+        num_replicas=world_size,
         rank=rank,
         shuffle=True,
         seed=args.global_seed
@@ -207,18 +257,20 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    if ema is not None and resume is None:
+        update_ema(ema, raw_model, decay=0)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
+    if ema is not None:
+        ema.eval()
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = resume.get("step", 0) if resume is not None else 0
     log_steps = 0
     running_loss = 0
     start_time = time()
 
     # Labels to condition the model with (feel free to change):
-    ys = torch.randint(1000, size=(local_batch_size,), device=device)
+    ys = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
     use_cfg = args.cfg_scale > 1.0
     # Create sampling noise:
     n = ys.size(0)
@@ -227,34 +279,49 @@ def main(args):
     # Setup classifier-free guidance:
     if use_cfg:
         zs = torch.cat([zs, zs], 0)
-        y_null = torch.tensor([1000] * n, device=device)
+        y_null = torch.tensor([args.num_classes] * n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        model_fn = ema.forward_with_cfg
+        model_fn = (ema if ema is not None else raw_model).forward_with_cfg
     else:
         sample_model_kwargs = dict(y=ys)
-        model_fn = ema.forward
+        model_fn = (ema if ema is not None else raw_model).forward
 
     logger.info(f"Training for {args.epochs} epochs...")
+    opt.zero_grad(set_to_none=True)
+    accumulated_loss = 0.0
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for batch_index, (x, y) in enumerate(loader):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             model_kwargs = dict(y=y)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+            group_size = min(args.grad_accum_steps,
+                             len(loader) - (batch_index // args.grad_accum_steps) * args.grad_accum_steps)
+            step_now = (batch_index + 1) % args.grad_accum_steps == 0 or batch_index + 1 == len(loader)
+            sync_context = (model.no_sync() if distributed and not step_now else nullcontext())
+            with sync_context:
+                with torch.autocast(device_type="cuda", dtype=(torch.bfloat16 if args.precision == "bf16" else torch.float16),
+                                    enabled=args.precision != "fp32"):
+                    loss_dict = transport.training_losses(model, x, model_kwargs)
+                    loss = loss_dict["loss"].mean()
+                scaler.scale(loss / group_size).backward()
+            accumulated_loss += loss.item()
+            if not step_now:
+                continue
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad(set_to_none=True)
+            if ema is not None:
+                update_ema(ema, raw_model)
 
             # Log loss values:
-            running_loss += loss.item()
+            running_loss += accumulated_loss / group_size
+            accumulated_loss = 0.0
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -264,8 +331,9 @@ def main(args):
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                if distributed:
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / world_size
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
@@ -278,35 +346,47 @@ def main(args):
                 start_time = time()
 
             # Save SiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+            if args.ckpt_every > 0 and train_steps % args.ckpt_every == 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
+                        "model": raw_model.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "step": train_steps,
+                        "scaler": scaler.state_dict(),
                     }
+                    if ema is not None:
+                        checkpoint["ema"] = ema.state_dict()
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                if distributed:
+                    dist.barrier()
             
-            if train_steps % args.sample_every == 0 and train_steps > 0:
-                logger.info("Generating EMA samples...")
+            if args.sample_every > 0 and train_steps % args.sample_every == 0:
+                logger.info("Generating samples...")
+                if ema is None:
+                    raw_model.eval()
                 with torch.no_grad():
                     sample_fn = transport_sampler.sample_ode() # default to ode sampling
                     samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
-                    dist.barrier()
+                    if distributed:
+                        dist.barrier()
 
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
                     samples = vae.decode(samples / 0.18215).sample
-                    out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                    dist.all_gather_into_tensor(out_samples, samples)
+                    if distributed:
+                        out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
+                        dist.all_gather_into_tensor(out_samples, samples)
+                    else:
+                        out_samples = samples
 
                 if args.wandb:
                     wandb_utils.log_image(out_samples, train_steps)
-                logging.info("Generating EMA samples done.")
+                if ema is None:
+                    raw_model.train()
+                logger.info("Generating samples done.")
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -321,6 +401,23 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
+    freeze = parser.add_mutually_exclusive_group()
+    freeze.add_argument("--freeze-backbone", dest="freeze_backbone", action="store_true",
+                        help="Train only new modules")
+    freeze.add_argument("--no-freeze-backbone", dest="freeze_backbone", action="store_false")
+    parser.set_defaults(freeze_backbone=None)
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--no-ema", dest="ema", action="store_false", help="Save GPU memory by omitting EMA")
+    parser.add_argument("--pretrained", type=str, default=None,
+                        help="Original SiT weights for a new ablation run")
+    sigma = parser.add_mutually_exclusive_group()
+    sigma.add_argument("--learn-sigma", dest="learn_sigma", action="store_true")
+    sigma.add_argument("--no-learn-sigma", dest="learn_sigma", action="store_false")
+    parser.set_defaults(learn_sigma=None)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
@@ -334,8 +431,12 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a custom SiT checkpoint")
+                        help="Full training checkpoint to resume, including optimizer")
 
     parse_transport_args(parser)
     args = parser.parse_args()
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps must be positive")
+    if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+        parser.error("This CUDA device does not support bf16")
     main(args)
