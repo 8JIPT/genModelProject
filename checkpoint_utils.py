@@ -10,7 +10,9 @@ from download import find_model
 def read_checkpoint(path):
     if path == "SiT-XL-2-256x256.pt" and not os.path.isfile(path):
         return find_model(path)
-    return torch.load(path, map_location="cpu")
+    # Full training checkpoints include argparse.Namespace. Retain the original
+    # behavior on PyTorch >= 2.6; only load trusted local checkpoints.
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def model_weights(checkpoint, prefer_ema=False):

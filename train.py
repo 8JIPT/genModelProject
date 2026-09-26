@@ -13,10 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
-from torchvision import transforms
-import numpy as np
 from collections import OrderedDict
-from PIL import Image
 from copy import deepcopy
 from glob import glob
 from time import time
@@ -24,12 +21,13 @@ import argparse
 import logging
 import os
 from contextlib import nullcontext
-from functools import partial
+from itertools import count
 
 from models import SiT_models
 from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
 from transport import create_transport, Sampler
-from diffusers.models import AutoencoderKL
+from latent_data import (CachedLatentDataset, LATENT_SCALE, center_crop_arr, image_transform,
+                         load_vae, sample_posterior, validate_numeric_labels)
 from train_utils import parse_transport_args
 import wandb_utils
 
@@ -85,56 +83,70 @@ def create_logger(logging_dir):
     return logger
 
 
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+def optimizer_step(args, model, raw_model, ema, transport, vae, opt, scaler,
+                   batches, group_size, device, distributed=False):
+    """The real training update, including data fetch and posterior sampling."""
+    accumulated_loss = 0.0
+    opt.zero_grad(set_to_none=True)
+    for micro_step in range(group_size):
+        x, y = next(batches)
+        x, y = x.to(device), y.to(device)
+        with torch.no_grad():
+            x = (sample_posterior(x) if args.latent_path else
+                 vae.encode(x).latent_dist.sample().mul_(LATENT_SCALE))
+        sync_context = (model.no_sync() if distributed and micro_step + 1 < group_size
+                        else nullcontext())
+        with sync_context:
+            with torch.autocast(device_type=device.type,
+                                dtype=torch.bfloat16 if args.precision == "bf16" else torch.float16,
+                                enabled=args.precision != "fp32"):
+                loss = transport.training_losses(model, x, dict(y=y))["loss"].mean()
+            scaler.scale(loss / group_size).backward()
+        accumulated_loss += loss.item()
+    old_scale = scaler.get_scale()
+    scaler.step(opt)
+    scaler.update()
+    # GradScaler decreases its scale when it skipped an update due to overflow.
+    updated = not scaler.is_enabled() or scaler.get_scale() >= old_scale
+    opt.zero_grad(set_to_none=True)
+    if updated and ema is not None:
+        update_ema(ema, raw_model)
+    return accumulated_loss / group_size, updated
 
 
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
-def main(args):
+def main(args, benchmark=None):
     """
     Trains a new SiT model.
     """
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    validate_args(args)
 
     # A single GPU can train directly (including on Windows); torchrun retains DDP.
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     if distributed:
-        dist.init_process_group("gloo" if os.name == "nt" else "nccl")
+        dist.init_process_group("gloo" if os.name == "nt" or args.device == "cpu" else "nccl")
         rank = dist.get_rank()
-        device = int(os.environ["LOCAL_RANK"])
+        device = torch.device("cpu" if args.device == "cpu" else f"cuda:{os.environ['LOCAL_RANK']}")
     else:
         rank = 0
-        device = 0
+        device = torch.device(args.device)
     assert args.global_batch_size % world_size == 0, "Batch size must be divisible by world size."
     seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
     local_batch_size = int(args.global_batch_size // world_size)
 
     # Setup an experiment folder:
-    if rank == 0:
+    if benchmark is not None:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        logger = logging.getLogger(__name__)
+    elif rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., SiT-XL/2 --> SiT-XL-2 (for naming folders)
@@ -201,7 +213,7 @@ def main(args):
 
     model = model.to(device)
     if distributed:
-        model = DDP(model, device_ids=[device])
+        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
     raw_model = model.module if distributed else model
     transport = create_transport(
         args.path_type,
@@ -211,8 +223,7 @@ def main(args):
         args.sample_eps
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    vae.requires_grad_(False).eval()
+    vae = None if args.latent_path else load_vae(args.vae, device)
     # Only parameters with gradients are passed to the optimizer.
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                             lr=args.learning_rate, weight_decay=0)
@@ -231,13 +242,11 @@ def main(args):
     torch.manual_seed(seed)
 
     # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(partial(center_crop_arr, image_size=args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    if args.latent_path:
+        dataset = CachedLatentDataset(args.latent_path, args.image_size, args.vae, args.num_classes)
+    else:
+        dataset = ImageFolder(args.data_path, transform=image_transform(args.image_size))
+        validate_numeric_labels(dataset.class_to_idx)
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -251,10 +260,12 @@ def main(args):
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    if not len(loader):
+        raise ValueError("Dataset is too small for this batch size/world size with drop_last=True")
+    logger.info(f"Dataset contains {len(dataset):,} examples ({args.latent_path or args.data_path})")
 
     # Prepare models for training:
     if ema is not None and resume is None:
@@ -269,64 +280,62 @@ def main(args):
     running_loss = 0
     start_time = time()
 
-    # Labels to condition the model with (feel free to change):
-    ys = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
-    use_cfg = args.cfg_scale > 1.0
-    # Create sampling noise:
-    n = ys.size(0)
-    zs = torch.randn(n, 4, latent_size, latent_size, device=device)
+    if args.sample_every > 0:
+        # Labels to condition the model with (feel free to change):
+        ys = torch.randint(args.num_classes, size=(local_batch_size,), device=device)
+        use_cfg = args.cfg_scale > 1.0
+        # Create sampling noise:
+        n = ys.size(0)
+        zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
-    # Setup classifier-free guidance:
-    if use_cfg:
-        zs = torch.cat([zs, zs], 0)
-        y_null = torch.tensor([args.num_classes] * n, device=device)
-        ys = torch.cat([ys, y_null], 0)
-        sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
-        model_fn = (ema if ema is not None else raw_model).forward_with_cfg
-    else:
-        sample_model_kwargs = dict(y=ys)
-        model_fn = (ema if ema is not None else raw_model).forward
+        # Setup classifier-free guidance:
+        if use_cfg:
+            zs = torch.cat([zs, zs], 0)
+            y_null = torch.tensor([args.num_classes] * n, device=device)
+            ys = torch.cat([ys, y_null], 0)
+            sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
+            model_fn = (ema if ema is not None else raw_model).forward_with_cfg
+        else:
+            sample_model_kwargs = dict(y=ys)
+            model_fn = (ema if ema is not None else raw_model).forward
 
-    logger.info(f"Training for {args.epochs} epochs...")
-    opt.zero_grad(set_to_none=True)
-    accumulated_loss = 0.0
-    for epoch in range(args.epochs):
+    if benchmark is not None:
+        args.max_steps = train_steps + benchmark.total_steps
+    logger.info(f"Training until step {args.max_steps}" if args.max_steps else f"Training for {args.epochs} epochs...")
+    if args.max_steps is not None and train_steps >= args.max_steps:
+        logger.info("Checkpoint already reached the requested optimizer step budget.")
+        cleanup()
+        return
+    skipped_updates = 0
+    epochs = count() if args.max_steps is not None else range(args.epochs)
+    for epoch in epochs:
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for batch_index, (x, y) in enumerate(loader):
-            x = x.to(device)
-            y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            model_kwargs = dict(y=y)
-            group_size = min(args.grad_accum_steps,
-                             len(loader) - (batch_index // args.grad_accum_steps) * args.grad_accum_steps)
-            step_now = (batch_index + 1) % args.grad_accum_steps == 0 or batch_index + 1 == len(loader)
-            sync_context = (model.no_sync() if distributed and not step_now else nullcontext())
-            with sync_context:
-                with torch.autocast(device_type="cuda", dtype=(torch.bfloat16 if args.precision == "bf16" else torch.float16),
-                                    enabled=args.precision != "fp32"):
-                    loss_dict = transport.training_losses(model, x, model_kwargs)
-                    loss = loss_dict["loss"].mean()
-                scaler.scale(loss / group_size).backward()
-            accumulated_loss += loss.item()
-            if not step_now:
+        batches = None
+        for group_start in range(0, len(loader), args.grad_accum_steps):
+            group_size = min(args.grad_accum_steps, len(loader) - group_start)
+            if benchmark is not None:
+                benchmark.begin(device)
+            if batches is None:
+                batches = iter(loader)
+            loss, updated = optimizer_step(args, model, raw_model, ema, transport, vae,
+                                           opt, scaler, batches, group_size, device, distributed)
+            if benchmark is not None:
+                benchmark.end(device, updated, group_size, distributed)
+            if not updated:
+                skipped_updates += 1
+                if skipped_updates >= 100:
+                    raise RuntimeError("100 consecutive AMP updates skipped; try bf16/fp32 or inspect numerical stability")
+                logger.warning("AMP overflow: optimizer update skipped; step counter unchanged")
                 continue
-            scaler.step(opt)
-            scaler.update()
-            opt.zero_grad(set_to_none=True)
-            if ema is not None:
-                update_ema(ema, raw_model)
-
-            # Log loss values:
-            running_loss += accumulated_loss / group_size
-            accumulated_loss = 0.0
+            skipped_updates = 0
+            running_loss += loss
             log_steps += 1
             train_steps += 1
-            if train_steps % args.log_every == 0:
+            if args.log_every > 0 and train_steps % args.log_every == 0:
                 # Measure training speed:
-                torch.cuda.synchronize()
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
@@ -346,7 +355,8 @@ def main(args):
                 start_time = time()
 
             # Save SiT checkpoint:
-            if args.ckpt_every > 0 and train_steps % args.ckpt_every == 0:
+            if benchmark is None and ((args.ckpt_every > 0 and train_steps % args.ckpt_every == 0)
+                                      or train_steps == args.max_steps):
                 if rank == 0:
                     checkpoint = {
                         "model": raw_model.state_dict(),
@@ -365,6 +375,8 @@ def main(args):
             
             if args.sample_every > 0 and train_steps % args.sample_every == 0:
                 logger.info("Generating samples...")
+                if vae is None:
+                    vae = load_vae(args.vae, device)
                 if ema is None:
                     raw_model.eval()
                 with torch.no_grad():
@@ -375,7 +387,7 @@ def main(args):
 
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
-                    samples = vae.decode(samples / 0.18215).sample
+                    samples = vae.decode(samples / LATENT_SCALE).sample
                     if distributed:
                         out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
                         dist.all_gather_into_tensor(out_samples, samples)
@@ -388,6 +400,13 @@ def main(args):
                     raw_model.train()
                 logger.info("Generating samples done.")
 
+            if args.max_steps is not None and train_steps >= args.max_steps:
+                break
+        if args.max_steps is not None and train_steps >= args.max_steps:
+            break
+
+    if benchmark is not None:
+        benchmark.report(args, device, world_size, rank)
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -395,10 +414,14 @@ def main(args):
     cleanup()
 
 
-if __name__ == "__main__":
+def build_parser():
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
+    data = parser.add_mutually_exclusive_group(required=True)
+    data.add_argument("--data-path", type=str)
+    data.add_argument("--latent-path", type=str)
+    parser.add_argument("--device", default="cuda", help="cuda, cuda:N, or cpu (for smoke tests)")
+    parser.add_argument("--max-steps", type=int, help="Stop at this successful optimizer step count; overrides epochs")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
@@ -423,7 +446,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
@@ -434,9 +457,28 @@ if __name__ == "__main__":
                         help="Full training checkpoint to resume, including optimizer")
 
     parse_transport_args(parser)
-    args = parser.parse_args()
-    if args.grad_accum_steps < 1:
-        parser.error("--grad-accum-steps must be positive")
-    if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
-        parser.error("This CUDA device does not support bf16")
-    main(args)
+    return parser
+
+
+def validate_args(args):
+    if args.grad_accum_steps < 1 or args.global_batch_size < 1 or args.epochs < 1:
+        raise ValueError("Accumulation, batch size, and epochs must be positive")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValueError("--max-steps must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be nonnegative")
+    device = torch.device(args.device)
+    if device.type not in ("cpu", "cuda"):
+        raise ValueError("Supported devices: cpu, cuda, cuda:N")
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA is unavailable; check the PyTorch build/driver, or use --device cpu for smoke tests")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", device.index or 0)))
+        if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+            raise ValueError("This CUDA device does not support bf16")
+    elif args.precision == "fp16":
+        raise ValueError("fp16 training requires CUDA; use fp32 or bf16 on CPU")
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())

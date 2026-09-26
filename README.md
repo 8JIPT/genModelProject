@@ -232,6 +232,154 @@ Add `--check-backward` to verify gradients through the frozen backbone and
 checkpointed blocks using a synthetic nonzero output/gate signal. Add `--amp`
 with `--device cuda` to run those checks under fp16 autocast.
 
+## Cached VAE posteriors and training-time benchmark
+
+`train.py` originally encodes RGB images with
+`AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")` (`--vae mse` selects
+`sd-vae-ft-mse`). Its transform is ADM resize/center crop, random horizontal
+flip with probability 0.5, `ToTensor`, and normalization with mean/std 0.5.
+It samples `vae.encode(x).latent_dist.sample()` on every visit and multiplies
+by **0.18215**. The scaled SiT-S/2 input at 256 pixels is **[B, 4, 32, 32]**.
+The transform and scale now live in `latent_data.py` and are shared by RGB
+training and preprocessing; the transport objective and architectures are unchanged.
+
+`precompute_latents.py` encodes the original and horizontally flipped RGB
+orientations separately, in FP32. Flipping an already encoded latent would
+not be equivalent. `posterior.npy` is a memory-mapped float32 array with shape
+`[N, 2 orientations, 2 parameters (mean/logvar), 4, 32, 32]`. The log-variance
+is the actual Diffusers posterior's clamped value; neither parameter is scaled.
+`manifest.json` stores the VAE identifier, transform/version, scale, class
+mapping/counts, and ordered relative image paths with labels, source sizes,
+and modification times. `progress.json` records the committed prefix.
+The complete 50k cache occupies approximately **3.05 GiB** plus JSON metadata.
+There are three files, rather than one metadata file per image.
+
+Each training visit selects an orientation with probability 0.5, samples
+`mean + exp(0.5 * logvar) * randn_like(mean)`, and multiplies by 0.18215.
+Both stochastic posterior sampling and flip augmentation are retained.
+FP32 storage avoids posterior quantization. This preserves the original
+training distribution, but does not promise bitwise identical full runs:
+encoding with different batch sizes/devices/library kernels can cause small
+floating-point differences, and worker scheduling/RNG consumption can differ.
+The VAE remains frozen. Cache generation uses the same TF32 backend flags as
+training; SiT AMP precision does not change the VAE encoding precision.
+
+Preprocessing verifies all 1,000 classes by default and optionally enforces
+50 images/class. Numeric folder names must agree with ImageFolder indices;
+missing/reordered numeric labels cause an error. Corrupt images fail with their
+path, without skipping/relabeling samples. Data is flushed before each progress
+commit. Rerunning the same command resumes an incomplete cache and avoids
+encoding an already completed cache. Changed source paths, sizes, timestamps,
+or configuration are rejected. After an abrupt process kill, a `.writer.lock`
+may remain: remove it only after verifying that no writer is running. An
+incomplete cache cannot be used for training. Completed caches are portable;
+training does not require the source RGB tree.
+
+From this repository, in the `SiT` environment, precompute the actual local
+50k subset (batch size 1 keeps VAE encoding memory modest):
+
+```bash
+conda activate SiT
+python precompute_latents.py \
+  --data-path data/imagenet50k/train \
+  --output-path data/imagenet50k_latents \
+  --image-size 256 --vae ema --num-classes 1000 --samples-per-class 50 \
+  --batch-size 1 --num-workers 4 --device cuda
+```
+
+The VAE downloads from Hugging Face on first use. `HF_HOME` can point to an
+existing download cache. CPU preprocessing is supported with `--device cpu`.
+
+Define the common experiment arguments once in Bash. Here the global
+micro-batch is 1 and accumulation is 8, so every update sees 8 examples on
+one GPU; 50,000 is divisible by 8. Keep these settings identical across runs.
+BF16 is checked for device support; if unavailable, choose FP16 or FP32 for
+**all** runs. The commands require a working CUDA-compatible PyTorch/driver.
+
+```bash
+common=(
+  --model SiT-S/2 --image-size 256
+  --pretrained pretrained_models/SiT-S-2-256.pt
+  --latent-path data/imagenet50k_latents --vae ema
+  --global-batch-size 1 --grad-accum-steps 8
+  --precision bf16 --learning-rate 1e-4 --num-workers 4
+  --device cuda --global-seed 0 --gradient-checkpointing
+  --no-ema --sample-every 0
+)
+
+python benchmark_train.py "${common[@]}" --variant baseline --no-freeze-backbone --output-json benchmark_baseline.json
+python benchmark_train.py "${common[@]}" --variant linear --freeze-backbone --output-json benchmark_linear.json
+python benchmark_train.py "${common[@]}" --variant uvit --freeze-backbone --output-json benchmark_uvit.json
+python benchmark_train.py "${common[@]}" --variant linear_uvit --freeze-backbone --output-json benchmark_linear_uvit.json
+```
+
+Each benchmark executes **200 successful optimizer updates**, excludes the
+first **20** for warm-up, and measures the remaining **180** with CUDA
+synchronization around each update. It calls `train.main` and the same
+`optimizer_step` as full training, reusing all model creation, checkpoint
+loading, freezing, AdamW setup, transport loss, accumulation, and EMA behavior.
+Timing includes DataLoader iteration/startup, transfers, posterior sampling,
+forward/loss/backward, optimizer updates, and EMA if enabled. Checkpointing,
+sample generation, W&B and periodic loss logging are disabled for the benchmark.
+It reports mean/median step time, throughput, configuration, and peak CUDA
+allocated/reserved memory during the timed phase. DDP uses the slowest rank's
+step time and largest rank memory. FP16 overflow attempts do not increment
+the step counter; their time is charged to the next successful update.
+`--steps` and `--warmup-steps` can shorten a development smoke test.
+
+The 10k/20k/40k estimates are simply `mean_seconds_per_update * target_steps`.
+They exclude startup, checkpoints, image generation and evaluation, and a
+short run may benefit from the OS file cache. They are training-time estimates,
+not model quality measurements. As in the original loop, a partial accumulation
+group at an epoch boundary uses its actual group size; the benchmark reports
+its effective-batch range when this happens. Choose batch/accumulation values
+that divide the dataset if a constant effective batch is required.
+
+After reviewing those timings, a 40,000-update combined-variant run is:
+
+```bash
+python train.py "${common[@]}" --variant linear_uvit --freeze-backbone \
+  --max-steps 40000 --ckpt-every 5000 --log-every 100 --results-dir results
+```
+
+For `linear` or `uvit`, change only the variant; for the baseline use
+`--variant baseline --no-freeze-backbone`. This retains the existing policy:
+baseline fine-tunes all original trainable weights, while modified variants
+train only their added/replaced modules. The untouched pretrained baseline
+remains a separate evaluation reference. `--freeze-backbone` on baseline is
+rejected because it has no new modules to optimize.
+
+`--max-steps` overrides the epoch limit and counts successful optimizer updates.
+Training saves a final checkpoint at that step even when it is not a periodic
+save step. To resume, replace `--pretrained ...` with `--ckpt ...` and retain the
+other settings; 40,000 then means the **total** checkpoint step target, not
+40,000 additional steps. Model/optimizer/EMA/scaler states are restored, but,
+as before, data-position and RNG states are not restored for bitwise replay.
+Full checkpoints contain Python configuration objects; only load trusted files.
+
+`--latent-path` and `--data-path` are mutually exclusive. Replacing the former
+with `--data-path data/imagenet50k/train` retains RGB + stochastic VAE training.
+With cached data and `--sample-every 0`, no VAE is instantiated. If image
+sampling is explicitly enabled, its decoder is loaded lazily at the first
+sampling event and retained; this adds memory and is outside benchmark timing.
+
+Run the small real-image smoke test (temporary two-class fixture, actual VAE
+and SiT checkpoint, a few optimizer updates; no 200-step run):
+
+```bash
+python verify_latents.py --device cpu \
+  --image data/imagenet50k/train/0279/000.jpg \
+  --pretrained pretrained_models/SiT-S-2-256.pt
+python verify_variants.py --device cpu --check-backward \
+  --pretrained pretrained_models/SiT-S-2-256.pt
+```
+
+The first checks both orientations, source/label preservation, fresh posterior
+noise, identical latent values with controlled noise on the tested device,
+cache restart/validation, corrupt input detection, spawned workers, all four
+cached optimizer updates, the RGB pathway, short benchmark accounting,
+absence of VAE loading in cached training, and checkpoint save/resume.
+
 ### Enhancements
 
 Training (and sampling) could likely be speed-up significantly by:
