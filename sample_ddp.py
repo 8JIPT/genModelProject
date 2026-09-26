@@ -10,9 +10,9 @@ For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
-from models import SiT_models
+from models import SiT_models, SiT_VARIANTS
 from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
-from transport import create_transport, Sampler
+from sampling_utils import build_sampler, sample_latents, decode_latents, images_to_uint8
 from diffusers.models import AutoencoderKL
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from tqdm import tqdm
@@ -90,43 +90,9 @@ def main(mode, args):
     model.eval()  # important!
     
     
-    transport = create_transport(
-        args.path_type,
-        args.prediction,
-        args.loss_weight,
-        args.train_eps,
-        args.sample_eps
-    )
-    sampler = Sampler(transport)
-    if mode == "ODE":
-        if args.likelihood:
-            assert args.cfg_scale == 1, "Likelihood is incompatible with guidance"
-            sample_fn = sampler.sample_ode_likelihood(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-            )
-        else:
-            sample_fn = sampler.sample_ode(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-                reverse=args.reverse
-            )
-    elif mode == "SDE":
-        sample_fn = sampler.sample_sde(
-            sampling_method=args.sampling_method,
-            diffusion_form=args.diffusion_form,
-            diffusion_norm=args.diffusion_norm,
-            last_step=args.last_step,
-            last_step_size=args.last_step_size,
-            num_steps=args.num_sampling_steps,
-        )
+    sample_fn = build_sampler(mode, args)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
-    using_cfg = args.cfg_scale > 1.0
 
     # Create folder to save samples:
     model_string_name = f"{args.model}-{args.variant}".replace("/", "-")
@@ -168,23 +134,8 @@ def main(mode, args):
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
         
-        # Setup classifier-free guidance:
-        if using_cfg:
-            z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
-            y = torch.cat([y, y_null], 0)
-            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-            model_fn = model.forward_with_cfg
-        else:
-            model_kwargs = dict(y=y)
-            model_fn = model.forward
-
-        samples = sample_fn(z, model_fn, **model_kwargs)[-1]
-        if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-
-        samples = vae.decode(samples / 0.18215).sample
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+        samples, _ = sample_latents(model, sample_fn, z, y, args.cfg_scale)
+        samples = images_to_uint8(decode_latents(vae, samples))
 
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
@@ -216,7 +167,7 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
 
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
+    parser.add_argument("--variant", choices=SiT_VARIANTS, default="baseline")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=4)

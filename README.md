@@ -143,9 +143,16 @@ torchrun --nnodes=1 --nproc_per_node=N sample_ddp.py ODE --model SiT-XL/2 --like
 
 Notice that only under ODE sampler likelihood can be calculated; see [`sample_ddp.py`](sample_ddp.py) for more details and settings. 
 
+## Full variants and FID/IS evaluation
+
+The project now also supports `full_linear`, `full_uvit`, and `full_linear_uvit`.
+See [EVALUATION.md](EVALUATION.md) for all seven architectures, parameter counts,
+training commands, explicit checkpoint selection, subset-FID/IS, generation
+timing, and reusable sample/reference caches.
+
 ## SiT-S/2 architecture ablations
 
-The `--variant` option selects four architectures without changing the original
+The four original `--variant` choices below retain the original
 `SiT-S/2` baseline state-dict keys:
 
 | Variant | Attention in blocks 0–7 | Attention in blocks 8–11 | Long skips |

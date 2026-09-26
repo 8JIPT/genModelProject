@@ -1,0 +1,2 @@
+# Optional metrics dependency; generation/training does not require it.
+torch-fidelity==0.4.0

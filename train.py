@@ -23,7 +23,7 @@ import os
 from contextlib import nullcontext
 from itertools import count
 
-from models import SiT_models
+from models import SiT_models, SiT_VARIANTS
 from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
 from transport import create_transport, Sampler
 from latent_data import (CachedLatentDataset, LATENT_SCALE, center_crop_arr, image_transform,
@@ -138,7 +138,7 @@ def main(args, benchmark=None):
     seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(device.index if device.index is not None else torch.cuda.current_device())
     print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
     local_batch_size = int(args.global_batch_size // world_size)
 
@@ -424,7 +424,7 @@ def build_parser():
     parser.add_argument("--max-steps", type=int, help="Stop at this successful optimizer step count; overrides epochs")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
+    parser.add_argument("--variant", choices=SiT_VARIANTS, default="baseline")
     freeze = parser.add_mutually_exclusive_group()
     freeze.add_argument("--freeze-backbone", dest="freeze_backbone", action="store_true",
                         help="Train only new modules")

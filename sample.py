@@ -10,9 +10,9 @@ torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
 from diffusers.models import AutoencoderKL
 from checkpoint_utils import infer_learn_sigma, load_pretrained, model_weights, read_checkpoint
-from models import SiT_models
+from models import SiT_models, SiT_VARIANTS
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
-from transport import create_transport, Sampler
+from sampling_utils import build_sampler, sample_latents, decode_latents
 import argparse
 import sys
 from time import time
@@ -51,43 +51,7 @@ def main(mode, args):
         print("Checkpoint load: missing keys: []; unexpected keys: []")
     print(model.architecture_summary())
     model.eval()  # important!
-    transport = create_transport(
-        args.path_type,
-        args.prediction,
-        args.loss_weight,
-        args.train_eps,
-        args.sample_eps
-    )
-    sampler = Sampler(transport)
-    if mode == "ODE":
-        if args.likelihood:
-            assert args.cfg_scale == 1, "Likelihood is incompatible with guidance"
-            sample_fn = sampler.sample_ode_likelihood(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-            )
-        else:
-            sample_fn = sampler.sample_ode(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-                reverse=args.reverse
-            )
-            
-    elif mode == "SDE":
-        sample_fn = sampler.sample_sde(
-            sampling_method=args.sampling_method,
-            diffusion_form=args.diffusion_form,
-            diffusion_norm=args.diffusion_norm,
-            last_step=args.last_step,
-            last_step_size=args.last_step_size,
-            num_steps=args.num_sampling_steps,
-        )
-    
-
+    sample_fn = build_sampler(mode, args)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     # Labels to condition the model with (feel free to change):
@@ -98,17 +62,10 @@ def main(mode, args):
     z = torch.randn(n, 4, latent_size, latent_size, device=device)
     y = torch.tensor(class_labels, device=device)
 
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-
-    # Sample images:
+    # Keep this script's original always-CFG behavior, including cfg_scale=1.
     start_time = time()
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
+    samples, _ = sample_latents(model, sample_fn, z, y, args.cfg_scale, force_cfg=True)
+    samples = decode_latents(vae, samples)
     print(f"Sampling took {time() - start_time:.2f} seconds.")
 
     # Save and display images:
@@ -128,7 +85,7 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--variant", choices=["baseline", "linear", "uvit", "linear_uvit"], default="baseline")
+    parser.add_argument("--variant", choices=SiT_VARIANTS, default="baseline")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)

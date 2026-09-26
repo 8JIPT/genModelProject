@@ -15,6 +15,10 @@ from torch.utils.checkpoint import checkpoint
 from LiT_linearAttn import LinearAttention
 
 
+SiT_VARIANTS = ("baseline", "linear", "uvit", "linear_uvit",
+                "full_linear", "full_uvit", "full_linear_uvit")
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -167,17 +171,22 @@ class SiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
-        if variant not in ("baseline", "linear", "uvit", "linear_uvit"):
+        if variant not in SiT_VARIANTS:
             raise ValueError(f"Unknown SiT variant: {variant}")
         if depth < 12 and variant in ("uvit", "linear_uvit"):
             raise ValueError("Long skips require at least 12 blocks")
         if depth < 4 and variant in ("linear", "linear_uvit"):
             raise ValueError("Linear attention requires at least four blocks")
+        if variant in ("full_uvit", "full_linear_uvit") and (depth < 4 or depth % 2):
+            raise ValueError("Full U-ViT skips require an even depth of at least four")
         self.variant = variant
         self.gradient_checkpointing = gradient_checkpointing
-        self.linear_block_indices = tuple(range(depth - 4, depth)) if "linear" in variant else ()
+        self.linear_block_indices = (tuple(range(depth)) if variant in ("full_linear", "full_linear_uvit")
+                                     else tuple(range(depth - 4, depth)) if "linear" in variant else ())
         # Source output -> target input. The projection is applied before the target block.
-        self.skip_sources = {depth - 3: 2, depth - 2: 1} if "uvit" in variant else {}
+        self.skip_sources = ({depth - 1 - source: source for source in range(depth // 2 - 1)}
+                             if variant in ("full_uvit", "full_linear_uvit")
+                             else {depth - 3: 2, depth - 2: 1} if "uvit" in variant else {})
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
